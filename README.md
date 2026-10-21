@@ -3,7 +3,9 @@
 Herramienta para **encontrar el TV en tu red Wi-Fi, analizarlo y acelerarlo**
 cuando dice "memoria casi llena" o está lento al encender o abrir apps.
 
-Se ejecuta en un **computador conectado al mismo Wi-Fi que el TV**.
+Se ejecuta en un **computador o iPhone conectado al mismo Wi-Fi que el TV**.
+
+📱 **¿Desde el iPhone?** Sigue [IPHONE.md](IPHONE.md).
 
 ## 1. Preparar el TV (una sola vez)
 

@@ -2,3 +2,5 @@ informe_tv_*.txt
 desactivadas.txt
 platform-tools/
 __pycache__/
+tv_ip.txt
+adbkey.json

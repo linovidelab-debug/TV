@@ -2,8 +2,10 @@
 """
 Optimizador para Smart TV Android (probado pensando en TV Caixun / Android TV).
 
-Se ejecuta en un computador conectado a la MISMA red Wi-Fi que el TV y se
-comunica con el TV mediante ADB (Android Debug Bridge).
+Se ejecuta en un computador o iPhone (app a-Shell) conectado a la MISMA red
+Wi-Fi que el TV y se comunica con el TV mediante ADB (Android Debug Bridge).
+Si no encuentra el programa 'adb', usa un cliente ADB incorporado escrito en
+Python puro, por lo que no necesita instalar nada más.
 
 Uso:
     python tv_optimizer.py buscar             # encuentra el TV en la red
@@ -25,14 +27,19 @@ import ipaddress
 import json
 import os
 import re
+import base64
+import secrets
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 
 ADB_PORT = 5555
 HERE = os.path.dirname(os.path.abspath(__file__))
 DISABLED_LOG = os.path.join(HERE, "desactivadas.txt")
+TV_IP_FILE = os.path.join(HERE, "tv_ip.txt")
+LITE_KEY_FILE = os.path.join(HERE, "adbkey.json")
 
 # Apps del sistema que normalmente se pueden desactivar sin romper el TV.
 # Se ofrecen solo si están instaladas y siempre se pregunta antes.
@@ -64,14 +71,11 @@ def find_adb():
     ):
         if candidate and os.path.isfile(candidate):
             return candidate
-    sys.exit(
-        "No encontré 'adb'. Descarga 'SDK Platform-Tools' desde\n"
-        "  https://developer.android.com/tools/releases/platform-tools\n"
-        "y descomprime la carpeta 'platform-tools' junto a este script."
-    )
+    return None
 
 
-ADB = None
+ADB = None   # ruta al programa adb, o None para usar el cliente incorporado
+LITE = None  # conexión del cliente incorporado (AdbLite)
 
 
 def adb(*args, timeout=60, check=False):
@@ -84,8 +88,185 @@ def adb(*args, timeout=60, check=False):
     return result.stdout.strip()
 
 
+# --------------------------------------------------------------------------
+# Cliente ADB incorporado (Python puro, para iPhone u otros equipos sin adb)
+# --------------------------------------------------------------------------
+
+def _is_probable_prime(n, rounds=40):
+    if n < 2:
+        return False
+    for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if n % p == 0:
+            return n == p
+    d, r = n - 1, 0
+    while d % 2 == 0:
+        d, r = d // 2, r + 1
+    for _ in range(rounds):
+        x = pow(secrets.randbelow(n - 3) + 2, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(r - 1):
+            x = pow(x, 2, n)
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def _random_prime(bits):
+    while True:
+        candidate = secrets.randbits(bits) | (1 << (bits - 1)) | (1 << (bits - 2)) | 1
+        if _is_probable_prime(candidate):
+            return candidate
+
+
+class AdbLite:
+    """Implementación mínima del protocolo ADB por TCP (conectar, shell, reboot)."""
+
+    VERSION = 0x01000001
+    MAX_DATA = 256 * 1024
+    CNXN, AUTH, OPEN, OKAY, CLSE, WRTE = (
+        struct.unpack("<I", c)[0] for c in (b"CNXN", b"AUTH", b"OPEN", b"OKAY", b"CLSE", b"WRTE"))
+    AUTH_TOKEN, AUTH_SIGNATURE, AUTH_RSAPUBLICKEY = 1, 2, 3
+    SHA1_DIGEST_INFO = bytes.fromhex("3021300906052b0e03021a05000414")
+
+    def __init__(self, host, port=ADB_PORT):
+        self.host, self.port = host, port
+        self.sock = None
+        self.next_id = 1
+        self.n, self.e, self.d = self._load_key()
+
+    # --- claves RSA (el TV las recuerda tras "Permitir siempre") ---
+
+    def _load_key(self):
+        try:
+            with open(LITE_KEY_FILE, encoding="utf-8") as fh:
+                k = json.load(fh)
+            return int(k["n"]), int(k["e"]), int(k["d"])
+        except (OSError, ValueError, KeyError):
+            pass
+        print("Generando clave de seguridad (solo la primera vez, puede tardar ~1 minuto)...")
+        e = 65537
+        while True:
+            p, q = _random_prime(1024), _random_prime(1024)
+            n, phi = p * q, (p - 1) * (q - 1)
+            if p != q and n.bit_length() == 2048 and phi % e:
+                break
+        d = pow(e, -1, phi)
+        with open(LITE_KEY_FILE, "w", encoding="utf-8") as fh:
+            json.dump({"n": str(n), "e": str(e), "d": str(d)}, fh)
+        return n, e, d
+
+    def _sign(self, token):
+        payload = self.SHA1_DIGEST_INFO + token
+        em = b"\x00\x01" + b"\xff" * (256 - 3 - len(payload)) + b"\x00" + payload
+        return pow(int.from_bytes(em, "big"), self.d, self.n).to_bytes(256, "big")
+
+    def _public_key(self):
+        words = 64  # 2048 bits / 32
+        n0inv = (-pow(self.n % 2 ** 32, -1, 2 ** 32)) % 2 ** 32
+        rr = pow(2, 4096, self.n)
+        blob = struct.pack("<II", words, n0inv)
+        blob += self.n.to_bytes(256, "little") + rr.to_bytes(256, "little")
+        blob += struct.pack("<i", self.e)
+        return base64.b64encode(blob) + b" tv_optimizer@iphone\x00"
+
+    # --- mensajes ---
+
+    def _send(self, cmd, arg0, arg1, data=b""):
+        header = struct.pack("<6I", cmd, arg0, arg1, len(data),
+                             sum(data) & 0xFFFFFFFF, cmd ^ 0xFFFFFFFF)
+        self.sock.sendall(header + data)
+
+    def _recv_exact(self, size):
+        buf = b""
+        while len(buf) < size:
+            chunk = self.sock.recv(size - len(buf))
+            if not chunk:
+                raise ConnectionError("El TV cerró la conexión.")
+            buf += chunk
+        return buf
+
+    def _recv(self):
+        cmd, arg0, arg1, length, _crc, _magic = struct.unpack("<6I", self._recv_exact(24))
+        return cmd, arg0, arg1, self._recv_exact(length) if length else b""
+
+    def connect(self, auth_wait=90):
+        self.sock = socket.create_connection((self.host, self.port), timeout=10)
+        self._send(self.CNXN, self.VERSION, self.MAX_DATA, b"host::\x00")
+        sent_signature = sent_key = False
+        while True:
+            cmd, arg0, _arg1, data = self._recv()
+            if cmd == self.CNXN:
+                return data.decode(errors="replace")
+            if cmd != self.AUTH or arg0 != self.AUTH_TOKEN:
+                continue
+            if not sent_signature:
+                self._send(self.AUTH, self.AUTH_SIGNATURE, 0, self._sign(data))
+                sent_signature = True
+            elif not sent_key:
+                self._send(self.AUTH, self.AUTH_RSAPUBLICKEY, 0, self._public_key())
+                sent_key = True
+                print("Mira el TV: acepta '¿Permitir depuración?' marcando 'Permitir siempre'.")
+                self.sock.settimeout(auth_wait)
+            else:
+                raise ConnectionError("El TV rechazó la conexión.")
+
+    def _stream(self, destination, timeout):
+        local_id = self.next_id
+        self.next_id += 1
+        self.sock.settimeout(timeout)
+        self._send(self.OPEN, local_id, 0, destination.encode() + b"\x00")
+        output, remote_id = [], 0
+        try:
+            while True:
+                cmd, arg0, arg1, data = self._recv()
+                if arg1 != local_id:
+                    continue
+                if cmd == self.OKAY:
+                    remote_id = arg0
+                elif cmd == self.WRTE:
+                    output.append(data)
+                    self._send(self.OKAY, local_id, arg0)
+                elif cmd == self.CLSE:
+                    if remote_id:
+                        self._send(self.CLSE, local_id, remote_id)
+                    break
+        except (socket.timeout, ConnectionError, OSError):
+            pass  # reboot corta la conexión; en shell devolvemos lo recibido
+        return b"".join(output).decode("utf-8", errors="replace").replace("\r\n", "\n").strip()
+
+    def shell(self, command, timeout=120):
+        return self._stream("shell:" + command, timeout)
+
+    def reboot(self):
+        self._stream("reboot:", 10)
+
+
+def lite_connect(host):
+    global LITE
+    LITE = AdbLite(host)
+    try:
+        LITE.connect()
+    except socket.timeout:
+        sys.exit("No se aceptó la conexión en el TV a tiempo. Reintenta y acepta el aviso.")
+    except OSError as exc:
+        sys.exit(f"No pude conectar con {host}:{ADB_PORT} ({exc}). "
+                 "Revisa que la depuración esté activada y que estés en el mismo Wi-Fi.")
+
+
 def sh(command, timeout=120):
+    if ADB is None:
+        return LITE.shell(command, timeout)
     return adb("shell", command, timeout=timeout)
+
+
+def reboot():
+    if ADB is None:
+        LITE.reboot()
+    else:
+        adb("reboot")
 
 
 def quote(path):
@@ -113,6 +294,15 @@ def title(text):
 
 
 def require_device():
+    if ADB is None:
+        if LITE is None:
+            try:
+                with open(TV_IP_FILE, encoding="utf-8") as fh:
+                    host = fh.read().strip()
+            except OSError:
+                sys.exit("No hay TV conectado. Ejecuta primero: python tv_optimizer.py conectar IP_DEL_TV")
+            lite_connect(host)
+        return
     lines = [l for l in adb("devices").splitlines()[1:] if l.strip()]
     ready = [l.split()[0] for l in lines if l.split()[-1] == "device"]
     if any(l.split()[-1] == "unauthorized" for l in lines):
@@ -164,7 +354,7 @@ def cmd_buscar(_args):
     for net in nets:
         print(f"Buscando dispositivos con ADB (puerto {ADB_PORT}) en {net} ...")
         hosts = list(net.hosts())
-        with concurrent.futures.ThreadPoolExecutor(max_workers=128) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
             for ip, ok in zip(hosts, pool.map(lambda h: port_open(h, ADB_PORT), hosts)):
                 if ok:
                     found.append(str(ip))
@@ -190,6 +380,13 @@ def cmd_buscar(_args):
 def cmd_conectar(args):
     if not args:
         sys.exit("Indica la IP del TV, por ejemplo: python tv_optimizer.py conectar 192.168.1.50")
+    if ADB is None:
+        print(f"Conectando a {args[0]} con el cliente incorporado ...")
+        lite_connect(args[0])
+        with open(TV_IP_FILE, "w", encoding="utf-8") as fh:
+            fh.write(args[0])
+        print("Conectado a:", sh("getprop ro.product.manufacturer"), sh("getprop ro.product.model"))
+        return
     target = args[0] if ":" in args[0] else f"{args[0]}:{ADB_PORT}"
     print(f"Conectando a {target} ... (si el TV muestra un aviso, elige 'Permitir siempre')")
     print(adb("connect", target, timeout=30))
@@ -369,7 +566,7 @@ def cmd_optimizar(_args):
         "  - Mantén al menos 1-2 GB libres de almacenamiento."
     )
     if ask("\n¿Reiniciar el TV ahora para aplicar todo?"):
-        adb("reboot")
+        reboot()
         print("Reiniciando...")
 
 
@@ -453,8 +650,9 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         print(__doc__)
         sys.exit(1)
-    if sys.argv[1] != "buscar":
-        ADB = find_adb()
+    ADB = find_adb()
+    if ADB is None and sys.argv[1] != "buscar":
+        print("(No encontré 'adb'; uso el cliente ADB incorporado.)")
     COMMANDS[sys.argv[1]](sys.argv[2:])
 
 
